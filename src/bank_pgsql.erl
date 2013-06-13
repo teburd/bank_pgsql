@@ -50,7 +50,7 @@
 %% trusted auth
 %% @end
 -spec connect(bank_client:opts()) -> {ok, bank_client:state()}
-	| {error, opts | timeout | auth | inet:posix(), string()}.
+	| {fatal, opts | timeout | auth | inet:posix(), string()}.
 connect(Opts) ->
 	case parse_opts(Opts) of
 		{ok, State} ->
@@ -148,10 +148,10 @@ connect_begin(State=#state{timeout=Timeout, host=Host, port=Port}) ->
 	case gen_tcp:connect(Host, Port, [binary, {active, false}, {packet, raw}], Timeout) of
 		{ok, Socket} ->
 			close_on_fatal(Socket, connect_send_auth(State#state{socket=Socket}));
-		_ ->
+		{error, Reason} ->
 			Message = io_lib:format("Failed to connect to host ~p on port ~p",
 				[Host, Port]),
-			{error, network, Message}
+			{fatal, Reason, Message}
 	end.
 
 %% @private
