@@ -42,6 +42,8 @@
 -define(int16, 1/big-signed-unit:16).
 -define(int32, 1/big-signed-unit:32).
 
+-define(PGSQL_PROTOCOL_VERSION, <<196608:32>>).
+
 
 %% @doc Connect to a postgresql database.
 %% By default this will connect to a localhost running postgresql server using
@@ -162,9 +164,10 @@ connect_send_auth(State=#state{socket=Socket, user=User, database=Database, time
 		undefined ->
 			Msg;
 		_ ->
-			Msg ++ ["database", 0, Database, 0]
+			[Msg | ["database", 0, Database, 0]]
 	end,
-	case send_msg(Socket, Timeout, 0, Msg0) of
+	Msg1 = [?PGSQL_PROTOCOL_VERSION, Msg0, 0],
+	case send_msg(Socket, Timeout, Msg1) of
 		ok ->
 			connect_recv_auth(State);
 		Other ->
@@ -174,22 +177,155 @@ connect_send_auth(State=#state{socket=Socket, user=User, database=Database, time
 %% @private
 %% @doc Wait for authentication message reply, send authentication password
 %% if needed and authentication method is supported (trust, md5)
-connect_recv_auth(State) ->
+connect_recv_auth(State=#state{socket=Socket, timeout=Timeout}) ->
+	case recv_msg(Socket, Timeout) of
+		{error, Reason} ->
+			error_logger:info_msg("response was ~x~n", [Rest]),
+			{fatal, auth, "Error response to startup message"};
+		<<$R, MsgLen:8/integer-unsigned
 	{ok, State}.
+
+%% Decode
+
+decode(<<Type:8, Len:?int32, Rest/binary>> = Bin, #state{c = C} = State) ->
+    Len2 = Len - 4,
+    case Rest of
+        <<Data:Len2/binary, Tail/binary>> when Type == $N ->
+            gen_fsm:send_all_state_event(C, {notice, decode_error(Data)}),
+            decode(Tail, State);
+        <<Data:Len2/binary, Tail/binary>> when Type == $S ->
+            [Name, Value] = decode_strings(Data),
+            gen_fsm:send_all_state_event(C, {parameter_status, Name, Value}),
+            decode(Tail, State);
+        <<Data:Len2/binary, Tail/binary>> when Type == $E ->
+            gen_fsm:send_event(C, {error, decode_error(Data)}),
+            decode(Tail, State);
+        <<Data:Len2/binary, Tail/binary>> when Type == $A ->
+            <<Pid:?int32, Strings/binary>> = Data,
+            case decode_strings(Strings) of
+                [Channel, Payload] -> ok;
+                [Channel]          -> Payload = <<>>
+            end,
+            gen_fsm:send_all_state_event(C, {notification, Channel, Pid, Payload}),
+            decode(Tail, State);
+        <<Data:Len2/binary, Tail/binary>> ->
+            gen_fsm:send_event(C, {Type, Data}),
+            decode(Tail, State);
+        _Other ->
+            State#state{tail = Bin}
+    end;
+decode(Bin, State) ->
+    State#state{tail = Bin}.
+
+%% decode a single null-terminated string
+decode_string(Bin) ->
+    decode_string(Bin, <<>>).
+
+decode_string(<<0, Rest/binary>>, Str) ->
+    {Str, Rest};
+decode_string(<<C, Rest/binary>>, Str) ->
+    decode_string(Rest, <<Str/binary, C>>).
+
+%% decode multiple null-terminated string
+decode_strings(Bin) ->
+    decode_strings(Bin, []).
+
+decode_strings(<<>>, Acc) ->
+    lists:reverse(Acc);
+decode_strings(Bin, Acc) ->
+    {Str, Rest} = decode_string(Bin),
+    decode_strings(Rest, [Str | Acc]).
+
+%% decode field
+decode_fields(Bin) ->
+    decode_fields(Bin, []).
+
+decode_fields(<<0>>, Acc) ->
+    Acc;
+decode_fields(<<Type:8, Rest/binary>>, Acc) ->
+    {Str, Rest2} = decode_string(Rest),
+    decode_fields(Rest2, [{Type, Str} | Acc]).
+
+%% decode ErrorResponse
+decode_error(Bin) ->
+    Fields = decode_fields(Bin),
+    Error = #error{
+      severity = lower_atom(proplists:get_value($S, Fields)),
+      code     = proplists:get_value($C, Fields),
+      message  = proplists:get_value($M, Fields),
+      extra    = decode_error_extra(Fields)},
+    Error.
+
+decode_error_extra(Fields) ->
+    Types = [{$D, detail}, {$H, hint}, {$P, position}],
+    decode_error_extra(Types, Fields, []).
+
+decode_error_extra([], _Fields, Extra) ->
+    Extra;
+decode_error_extra([{Type, Name} | T], Fields, Extra) ->
+    case proplists:get_value(Type, Fields) of
+        undefined -> decode_error_extra(T, Fields, Extra);
+        Value     -> decode_error_extra(T, Fields, [{Name, Value} | Extra])
+    end.
+
+
+%% Socket
+
+%% @private
+%% @doc Recieve and decode a single message from the socket with a timeout
+recv_msg(Socket, Timeout) ->
+	case recv_msg_type(Socket, Timeout) of
+		{ok, MsgType, MsgLen} ->
+			recv_msg_body(Socket, Timeout, MsgType, MsgLen);
+		{error, timeout} ->
+			{fatal, timeout, "Timeout receiving message type"};
+		{error, Reason} ->
+			{fatal, Reason, "Socket error receiving message type"};
+		_ ->
+			{fatal, socket, "Failed to match on message header"}
+	end.
+
+%% @private
+%% @doc Receive the first 5 bytes contain
+recv_msg_type(Socket, Timeout) ->
+	case gen_tcp:recv(Socket, 5, Timeout) of
+		{ok, <<Type:8, Len:32>>} ->
+			{ok, Type, Len};
+		Other ->
+			Other
+	end.
+
+%% @private
+%% @doc Receive and then decode the message body
+recv_msg_body(Socket, Timeout, Type, Len) ->
+	case gen_tcp:recv(Socket, Len, Timeout) of
+		{ok, Body} ->
+			msg_decode(Type, Len, Body);
+		Other ->
+			Other
+	end.
+
 
 %% @private 
 %% @doc Encode a message with a type and send it with a timeout
-send_msg(Socket, Timeout, Type, Msg) ->
-	Msg0 = iolist_to_binary(Msg),
-	Msg1 = <<Type:8, (byte_size(Msg0) + 4):?int32, Msg0/binary>>,
-	send_msg(Socket, Timeout, Msg1).
+%%send_msg(Socket, Timeout, Type, Msg) ->
+%%	Msg0 = iolist_to_binary(Msg),
+%%	Data = <<Type:8, (byte_size(Msg0) + 4):?int32, Msg0/binary>>,
+%%	send_data(Socket, Timeout, Data).
 
 %% @private 
-%% @doc Send a msg on a socket with a timeout.
+%% @doc Encode a message and send it with a timeout
 send_msg(Socket, Timeout, Msg) ->
+	Msg0 = iolist_to_binary(Msg),
+	Data = <<(byte_size(Msg0) + 4):?int32, Msg0/binary>>,
+	send_data(Socket, Timeout, Data).
+
+%% @private 
+%% @doc Send data on a socket with a timeout.
+send_data(Socket, Timeout, Data) ->
 	case inet:setopts(Socket, [{send_timeout, Timeout}, {send_timeout_close, true}]) of
 		ok ->
-			send_data(Socket, Msg);
+			send_data(Socket, Data);
 		{error, Reason} ->
 			{fatal, Reason, "Failed to set socket timeout options"}
 	end.
@@ -205,4 +341,7 @@ send_data(Socket, Data) ->
 		{error, Reason} ->
 			{error, Reason, "Socket send failed"}
 	end.
+
+
+
 
