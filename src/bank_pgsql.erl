@@ -139,7 +139,7 @@ parse_opts(Opts) ->
 validate_user_opt(#state{user=undefined}) ->
 	{error, opts, "Missing user connection option"};
 validate_user_opt(State) ->
-	State.
+	{ok, State}.
 
 
 %% @private
@@ -147,7 +147,7 @@ validate_user_opt(State) ->
 connect_begin(State=#state{timeout=Timeout, host=Host, port=Port}) ->
 	case gen_tcp:connect(Host, Port, [binary, {active, false}, {packet, raw}], Timeout) of
 		{ok, Socket} ->
-			connect_send_auth(State#state{socket=Socket});
+			close_on_fatal(Socket, connect_send_auth(State#state{socket=Socket}));
 		_ ->
 			Message = io_lib:format("Failed to connect to host ~p on port ~p",
 				[Host, Port]),
@@ -179,132 +179,75 @@ connect_send_auth(State=#state{socket=Socket, user=User, database=Database, time
 %% if needed and authentication method is supported (trust, md5)
 connect_recv_auth(State=#state{socket=Socket, timeout=Timeout}) ->
 	case recv_msg(Socket, Timeout) of
-		{error, Reason} ->
-			error_logger:info_msg("response was ~x~n", [Rest]),
-			{fatal, auth, "Error response to startup message"};
-		<<$R, MsgLen:8/integer-unsigned
-	{ok, State}.
+		auth_ok ->
+			{ok, State};
+		%%{auth_md5, Hash} ->
+		%%	connect_send_auth_md5(Hash, State);
+		{fatal, Reason, Message} ->
+			{fatal, Reason, Message};
+		{AuthType, _} ->
+			Message = io_lib:format("Unsupported authentacation request ~p", [AuthType]),
+			{fatal, auth, Message};
+		AuthType when is_atom(AuthType) ->
+			Message = io_lib:format("Unsupported authentacation request ~p", [AuthType]),
+			{fatal, auth, Message}
+	end.
 
 %% Decode
 
-decode(<<Type:8, Len:?int32, Rest/binary>> = Bin, #state{c = C} = State) ->
-    Len2 = Len - 4,
-    case Rest of
-        <<Data:Len2/binary, Tail/binary>> when Type == $N ->
-            gen_fsm:send_all_state_event(C, {notice, decode_error(Data)}),
-            decode(Tail, State);
-        <<Data:Len2/binary, Tail/binary>> when Type == $S ->
-            [Name, Value] = decode_strings(Data),
-            gen_fsm:send_all_state_event(C, {parameter_status, Name, Value}),
-            decode(Tail, State);
-        <<Data:Len2/binary, Tail/binary>> when Type == $E ->
-            gen_fsm:send_event(C, {error, decode_error(Data)}),
-            decode(Tail, State);
-        <<Data:Len2/binary, Tail/binary>> when Type == $A ->
-            <<Pid:?int32, Strings/binary>> = Data,
-            case decode_strings(Strings) of
-                [Channel, Payload] -> ok;
-                [Channel]          -> Payload = <<>>
-            end,
-            gen_fsm:send_all_state_event(C, {notification, Channel, Pid, Payload}),
-            decode(Tail, State);
-        <<Data:Len2/binary, Tail/binary>> ->
-            gen_fsm:send_event(C, {Type, Data}),
-            decode(Tail, State);
-        _Other ->
-            State#state{tail = Bin}
-    end;
-decode(Bin, State) ->
-    State#state{tail = Bin}.
 
-%% decode a single null-terminated string
-decode_string(Bin) ->
-    decode_string(Bin, <<>>).
-
-decode_string(<<0, Rest/binary>>, Str) ->
-    {Str, Rest};
-decode_string(<<C, Rest/binary>>, Str) ->
-    decode_string(Rest, <<Str/binary, C>>).
-
-%% decode multiple null-terminated string
-decode_strings(Bin) ->
-    decode_strings(Bin, []).
-
-decode_strings(<<>>, Acc) ->
-    lists:reverse(Acc);
-decode_strings(Bin, Acc) ->
-    {Str, Rest} = decode_string(Bin),
-    decode_strings(Rest, [Str | Acc]).
-
-%% decode field
-decode_fields(Bin) ->
-    decode_fields(Bin, []).
-
-decode_fields(<<0>>, Acc) ->
-    Acc;
-decode_fields(<<Type:8, Rest/binary>>, Acc) ->
-    {Str, Rest2} = decode_string(Rest),
-    decode_fields(Rest2, [{Type, Str} | Acc]).
-
-%% decode ErrorResponse
-decode_error(Bin) ->
-    Fields = decode_fields(Bin),
-    Error = #error{
-      severity = lower_atom(proplists:get_value($S, Fields)),
-      code     = proplists:get_value($C, Fields),
-      message  = proplists:get_value($M, Fields),
-      extra    = decode_error_extra(Fields)},
-    Error.
-
-decode_error_extra(Fields) ->
-    Types = [{$D, detail}, {$H, hint}, {$P, position}],
-    decode_error_extra(Types, Fields, []).
-
-decode_error_extra([], _Fields, Extra) ->
-    Extra;
-decode_error_extra([{Type, Name} | T], Fields, Extra) ->
-    case proplists:get_value(Type, Fields) of
-        undefined -> decode_error_extra(T, Fields, Extra);
-        Value     -> decode_error_extra(T, Fields, [{Name, Value} | Extra])
-    end.
-
+%% Auth Request
+decode_msg($R, <<0:?int32>>) ->
+	auth_ok;
+decode_msg($R, <<2:?int32>>) ->
+	auth_kerberos;
+decode_msg($R, <<3:?int32>>) ->
+	auth_cleartext;
+decode_msg($R, <<5:?int32, Salt/binary>>) ->
+	{auth_md5, Salt};
+decode_msg($R, <<8:?int32, 7:?int32>>) ->
+	auth_gssapi;
+decode_msg($R, <<8:?int32, 9:?int32>>) ->
+	auth_sspi;
+decode_msg($R, <<8:?int32, Rest/binary>>) ->
+	{auth_gss_cont, Rest}.
 
 %% Socket
+close_on_fatal(Socket, {fatal, Reason, Message}) ->
+	gen_tcp:close(Socket),
+	{fatal, Reason, Message};
+close_on_fatal(_, Result) ->
+	Result.
 
 %% @private
 %% @doc Recieve and decode a single message from the socket with a timeout
 recv_msg(Socket, Timeout) ->
-	case recv_msg_type(Socket, Timeout) of
-		{ok, MsgType, MsgLen} ->
-			recv_msg_body(Socket, Timeout, MsgType, MsgLen);
-		{error, timeout} ->
-			{fatal, timeout, "Timeout receiving message type"};
-		{error, Reason} ->
-			{fatal, Reason, "Socket error receiving message type"};
-		_ ->
-			{fatal, socket, "Failed to match on message header"}
-	end.
+	recv_msg_type(Socket, Timeout).
 
 %% @private
-%% @doc Receive the first 5 bytes contain
+%% @doc Receive the first 5 bytes which contains the type and len of the message
 recv_msg_type(Socket, Timeout) ->
 	case gen_tcp:recv(Socket, 5, Timeout) of
 		{ok, <<Type:8, Len:32>>} ->
-			{ok, Type, Len};
-		Other ->
-			Other
+			recv_msg_body(Socket, Timeout, Type, Len);
+		{error, timeout} ->
+			{fatal, timeout, "Timed out recveiving message header"};
+		{error, Reason} ->
+			{fatal, Reason, "Error receiving message header"}
 	end.
 
 %% @private
-%% @doc Receive and then decode the message body
+%% @doc Receive the body of the message and then decode it
 recv_msg_body(Socket, Timeout, Type, Len) ->
-	case gen_tcp:recv(Socket, Len, Timeout) of
+	Len2 = Len - 4,
+	case gen_tcp:recv(Socket, Len2, Timeout) of
 		{ok, Body} ->
-			msg_decode(Type, Len, Body);
-		Other ->
-			Other
+			decode_msg(Type, Body);
+		{error, timeout} ->
+			{fatal, timeout, "Timed out recveiving message body"};
+		{error, Reason} ->
+			{fatal, Reason, "Error receiving message body"}
 	end.
-
 
 %% @private 
 %% @doc Encode a message with a type and send it with a timeout
