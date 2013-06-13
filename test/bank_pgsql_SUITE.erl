@@ -13,10 +13,12 @@
 
 %% tests
 -export([connect_close/1]).
+-export([connect_bad_user/1]).
 
 all() ->
 	[
-		connect_close	
+		connect_close,
+		connect_bad_user
 	].
 
 init_per_suite(Config) ->
@@ -29,3 +31,5 @@ connect_close(_Config) ->
 	{ok, Client} = bank_pgsql:connect([{user, "bank_pgsql"}]),
 	{ok, _Client0} = bank_pgsql:close(Client).
 
+connect_bad_user(_Config) ->
+	{fatal, _Reason, _Message} = bank_pgsql:connect([{user, "superdupermarioman"}]).
