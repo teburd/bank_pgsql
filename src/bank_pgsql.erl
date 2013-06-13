@@ -179,13 +179,14 @@ connect_send_auth(State=#state{socket=Socket, user=User, database=Database, time
 %% if needed and authentication method is supported (trust, md5)
 connect_recv_auth(State=#state{socket=Socket, timeout=Timeout}) ->
 	case recv_msg(Socket, Timeout) of
+		{error, Info} ->
+			Message = error_message(Info),
+			{fatal, auth, Message};
 		auth_ok ->
 			{ok, State};
 		%%{auth_md5, Hash} ->
 		%%	connect_send_auth_md5(Hash, State);
-		{fatal, Reason, Message} ->
-			{fatal, Reason, Message};
-		{AuthType, _} ->
+		{AuthType, _} when is_atom(AuthType) ->
 			Message = io_lib:format("Unsupported authentacation request ~p", [AuthType]),
 			{fatal, auth, Message};
 		AuthType when is_atom(AuthType) ->
@@ -193,16 +194,16 @@ connect_recv_auth(State=#state{socket=Socket, timeout=Timeout}) ->
 			{fatal, auth, Message}
 	end.
 
-%% Decode
-
-
-%% Auth Request
+%% @private
+%% @doc Decode a message from PostgreSQL
+decode_msg($E, Rest) ->
+	{error, decode_error_fields(Rest)};
 decode_msg($R, <<0:?int32>>) ->
 	auth_ok;
 decode_msg($R, <<2:?int32>>) ->
-	auth_kerberos;
+	auth_kerberos_v5;
 decode_msg($R, <<3:?int32>>) ->
-	auth_cleartext;
+	auth_clear_text;
 decode_msg($R, <<5:?int32, Salt/binary>>) ->
 	{auth_md5, Salt};
 decode_msg($R, <<8:?int32, 7:?int32>>) ->
@@ -210,9 +211,70 @@ decode_msg($R, <<8:?int32, 7:?int32>>) ->
 decode_msg($R, <<8:?int32, 9:?int32>>) ->
 	auth_sspi;
 decode_msg($R, <<8:?int32, Rest/binary>>) ->
-	{auth_gss_cont, Rest}.
+	{auth_gss_cont, Rest};
+decode_msg(_, _) ->
+	{fatal, decode, "!!!Unknown message!!!"}.
 
-%% Socket
+%% @private
+%% @doc Decode error fields in to a proplist
+decode_error_fields(ErrorFields) ->
+	decode_error_fields(ErrorFields, []).
+
+decode_error_fields(<<0>>, Acc) ->
+	Acc;
+decode_error_fields(<<Type:8, More/binary>>, Acc) ->
+	Key = decode_error_name(Type),
+	{Value, More0} = decode_string(More),
+	case Key of 
+		undefined ->
+			decode_error_fields(More0, Acc);
+		_ ->
+			decode_error_fields(More0, [{Key, Value} | Acc])
+	end.
+
+%% @private
+%% @doc Decode error type to atom
+decode_error_name($S) ->
+	severity;
+decode_error_name($C) ->
+	code;
+decode_error_name($M) ->
+	message;
+decode_error_name($D) ->
+	detail;
+decode_error_name($H) ->
+	hint;
+decode_error_name($P) ->
+	position;
+decode_error_name($p) ->
+	internal_position;
+decode_error_name($q) ->
+	internal_query;
+decode_error_name($W) ->
+	where_context;
+decode_error_name($F) ->
+	file;
+decode_error_name($L) ->
+	line;
+decode_error_name($R) ->
+	routine;
+decode_error_name(_) ->
+	undefined.
+
+%% @private
+%% @doc Decode a single null-terminated string
+decode_string(Bin) ->
+    decode_string(Bin, <<>>).
+
+%% @private
+decode_string(<<0, Rest/binary>>, Str) ->
+    {Str, Rest};
+decode_string(<<C, Rest/binary>>, Str) ->
+    decode_string(Rest, <<Str/binary, C>>).
+
+
+%% @private
+%% @doc Helper to close the socket on a fatal error
 close_on_fatal(Socket, {fatal, Reason, Message}) ->
 	gen_tcp:close(Socket),
 	{fatal, Reason, Message};
@@ -284,3 +346,8 @@ send_data(Socket, Data) ->
 		{error, Reason} ->
 			{error, Reason, "Socket send failed"}
 	end.
+
+%% @private
+%% @doc Generate a useful error message error response fields
+error_message(Info) ->
+	proplists:get_value(message, Info).
