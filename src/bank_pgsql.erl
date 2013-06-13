@@ -284,7 +284,3 @@ send_data(Socket, Data) ->
 		{error, Reason} ->
 			{error, Reason, "Socket send failed"}
 	end.
-
-
-
-
