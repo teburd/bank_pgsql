@@ -32,4 +32,5 @@ connect_close(_Config) ->
 	{ok, _Client0} = bank_pgsql:close(Client).
 
 connect_bad_user(_Config) ->
-	{fatal, _Reason, _Message} = bank_pgsql:connect([{user, "superdupermarioman"}]).
+	{fatal, Reason, Message} = bank_pgsql:connect([{user, "superdupermarioman"}]),
+	ct:pal("bad user reason ~p, message ~s~n", [Reason, Message]).
