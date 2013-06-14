@@ -62,7 +62,8 @@ connect(Opts) ->
 
 %% @doc Close connection to postgresql server if its connected.
 -spec close(bank_client:state()) -> {ok, bank_client:state()}.
-close(State) ->
+close(State=#state{socket=Socket}) ->
+	ok = gen_tcp:close(Socket),
 	{ok, State}.
 
 %% @doc Ping remote server to ensure connection is still alive
@@ -183,7 +184,7 @@ connect_recv_auth(State=#state{socket=Socket, timeout=Timeout}) ->
 			Message = error_message(Info),
 			{fatal, auth, Message};
 		auth_ok ->
-			{ok, State};
+			connect_recv_ready(State);
 		%%{auth_md5, Hash} ->
 		%%	connect_send_auth_md5(Hash, State);
 		{AuthType, _} when is_atom(AuthType) ->
@@ -194,17 +195,36 @@ connect_recv_auth(State=#state{socket=Socket, timeout=Timeout}) ->
 			{fatal, auth, Message}
 	end.
 
+
+%% @private
+%% @doc Wait for either a ready_for_query or error message
+connect_recv_ready(State=#state{socket=Socket, timeout=Timeout}) ->
+	case recv_msg(Socket, Timeout) of
+		{fatal, Reason, Message} ->
+			{fatal, Reason, Message};
+		{error, Info} ->
+			Message = error_message(Info),
+			{fatal, auth, Message};
+		{ready_for_query, $I} ->
+			{ok, State};
+		Other ->
+			ct:pal("recv'd ~p message~n", [Other]),
+			connect_recv_ready(State)
+	end.
+
 %% @private
 %% @doc Decode a message from PostgreSQL
 decode_msg($E, Rest) ->
 	{error, decode_error_fields(Rest)};
 decode_msg($R, <<0:?int32>>) ->
+	ct:pal("got auth ok~n"),
 	auth_ok;
 decode_msg($R, <<2:?int32>>) ->
 	auth_kerberos_v5;
 decode_msg($R, <<3:?int32>>) ->
 	auth_clear_text;
 decode_msg($R, <<5:?int32, Salt/binary>>) ->
+	ct:pal("got auth md5~n"),
 	{auth_md5, Salt};
 decode_msg($R, <<8:?int32, 7:?int32>>) ->
 	auth_gssapi;
@@ -212,6 +232,16 @@ decode_msg($R, <<8:?int32, 9:?int32>>) ->
 	auth_sspi;
 decode_msg($R, <<8:?int32, Rest/binary>>) ->
 	{auth_gss_cont, Rest};
+decode_msg($K, <<Pid:?int32, Key:?int32>>) ->
+	{backend_key_data, Pid, Key};
+decode_msg($Z, <<Status:8>>) ->
+	{ready_for_query, Status};
+decode_msg($S, Data) ->
+	{Name, More} = decode_string(Data),
+	{Value, _More0} = decode_string(More),
+	{parameter_status, Name, Value};
+decode_msg($N, _Data) ->
+	{notice, []};
 decode_msg(_, _) ->
 	{fatal, decode, "!!!Unknown message!!!"}.
 
@@ -290,7 +320,8 @@ recv_msg(Socket, Timeout) ->
 %% @doc Receive the first 5 bytes which contains the type and len of the message
 recv_msg_type(Socket, Timeout) ->
 	case gen_tcp:recv(Socket, 5, Timeout) of
-		{ok, <<Type:8, Len:32>>} ->
+		{ok, <<Type:8, Len:?int32>>} ->
+			ct:pal("got message type ~c len ~p~n", [Type, Len]),
 			recv_msg_body(Socket, Timeout, Type, Len);
 		{error, timeout} ->
 			{fatal, timeout, "Timed out recveiving message header"};

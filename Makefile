@@ -15,6 +15,7 @@ PLT_APPS = crypto
 DEPS = bank
 dep_bank = https://github.com/bfrog/bank.git transactions
 
+include erlang.mk
 
 create_db:
 	psql -f test/create.sql
@@ -22,4 +23,4 @@ create_db:
 drop_db:
 	psql -f test/drop.sql
 
-include erlang.mk
+
